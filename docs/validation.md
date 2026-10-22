@@ -93,7 +93,7 @@ as evaluation. It excludes loading, output copies to CPU, detokenization and
 reference scoring. CUDA is synchronized and TF32 is disabled. The script records
 all repeats, peak allocated CUDA memory, generator calls, output identity, source
 and artifact hashes. It fails when compared outputs differ instead of reporting
-a speedup without fidelity evidence.
+a speedup without fidelity evidence. Mode order alternates between repetitions.
 
 A supplied level 0 requires a separate prefix-prefill call in the current cached
 implementation. Count this call explicitly; generator calls and hierarchy depth

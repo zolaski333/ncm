@@ -55,6 +55,8 @@ def main():
         ap.error("n, bs and repeats must be positive; warmup must be nonnegative")
     if any(mode not in ("eager", "kv") for mode in modes):
         ap.error("modes must be eager or kv")
+    if len(set(modes)) != len(modes):
+        ap.error("modes must not repeat")
 
     cfg = OmegaConf.load(a.config)
     if not cfg.data or not cfg.data.get("test"):
@@ -119,9 +121,11 @@ def main():
         saved = torch.tensor(part["raw_ids"])
 
     results, baseline = [], None
-    for mode in modes:
-        durations, peaks, calls_per_batch = [], [], []
-        for repeat in range(a.repeats):
+    measurements = {mode: ([], [], []) for mode in modes}
+    for repeat in range(a.repeats):
+        # Alternate order to reduce systematic first/second-mode timing effects.
+        for mode in modes if repeat % 2 == 0 else modes[::-1]:
+            durations, peaks, calls_per_batch = measurements[mode]
             torch.manual_seed(a.seed)
             for _ in range(a.warmup):
                 run(inputs[:a.bs], mode == "kv")
@@ -152,6 +156,8 @@ def main():
                 raise RuntimeError(f"{mode} repeat {repeat}: concept codes or decoded tokens differ from the first run")
             if saved is not None and not torch.equal(tokens, saved):
                 raise RuntimeError("benchmark output differs from eval_shard.py")
+    for mode in modes:
+        durations, peaks, calls_per_batch = measurements[mode]
         row = dict(mode=mode, times_seconds=durations, median_seconds=statistics.median(durations),
                    peak_allocated_bytes=peaks, generator_calls_per_batch=calls_per_batch,
                    concepts_identical=True, tokens_identical=True,
@@ -173,6 +179,7 @@ def main():
         config_sha256=sha256(a.config), generator_sha256=sha256(generator_path),
         tokenizer_sha256=sha256(ck / cfg.checkpoints.tokenizer),
         inputs_sha256=sha256(dd / cfg.data.test), results=results,
+        mode_order="requested order on even repeats, reversed order on odd repeats",
         timing="generation + VQ decoding + final-token penalties; excludes loading, CPU copies and scoring",
     )
     if a.json:
