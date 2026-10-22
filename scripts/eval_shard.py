@@ -149,6 +149,7 @@ out["metadata"] = {
     "run_id": a.run_id, "shard": a.shard, "nshards": a.nshards,
     "config_sha256": config_hash, "checkpoint_dir": os.path.abspath(ck),
     "data_dir": os.path.abspath(dd), "split": split, "n": n,
+    "n_inputs": None if UNCOND else len(items),
     "policy": dict(temperature=temp, top_k=top_k, top_p=top_p, cfg=cfg,
                    frequency=freq, deficit=mu, adjacency=adj, level0=L0_MODE,
                    kv_cache=a.kv_cache, batch_size=bs),

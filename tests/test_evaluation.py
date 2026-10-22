@@ -92,6 +92,11 @@ class EvaluationTests(unittest.TestCase):
         self.assertIn("merged 1 shards", result.stdout)
         self.assertIn("malformed", result.stdout)
 
+    def test_truncated_tail_is_rejected_even_when_indices_have_no_gaps(self):
+        part = self.part([0], metadata=dict(run_id="run", shard=0, nshards=1, n_inputs=2))
+        with self.assertRaisesRegex(ValueError, "missing conditional"):
+            load_shards([self.save("truncated.pkl", part)])
+
 
 if __name__ == "__main__":
     unittest.main()

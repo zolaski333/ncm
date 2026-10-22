@@ -53,7 +53,8 @@ def load_shards(paths, *, unconditional=False, run_id=None):
 
     if not parts or not any(part["hyps"] for part in parts):
         raise ValueError("no samples in shard files")
-    if not unconditional and indices != set(range(len(indices))):
+    expected_inputs = policy.get("n_inputs", len(indices)) if policy is not None else len(indices)
+    if not unconditional and indices != set(range(expected_inputs)):
         raise ValueError("missing conditional sample indices")
     if policy is not None and shard_numbers != set(range(policy["nshards"])):
         raise ValueError("missing shard files")
