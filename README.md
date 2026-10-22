@@ -67,26 +67,29 @@ Python 3.10 or newer and a CUDA-capable PyTorch installation are recommended.
 
 ## Evaluation
 
-Download the checkpoints and evaluation inputs:
+Download the checkpoint and evaluation inputs for the task you want to run. For example, for Sudoku easy:
 
 ```bash
-hf download hazyresearch/ncm-checkpoints --local-dir artifacts
-hf download hazyresearch/ncm-datasets --repo-type dataset --local-dir data
+hf download hazyresearch/ncm-checkpoints --include "sudoku/easy/*" --local-dir artifacts
+hf download hazyresearch/ncm-datasets --repo-type dataset --include "sudoku/easy/*" --local-dir data
 ```
 
 Then run:
 
 ```bash
-python evaluate.py --config config/eval/<task>.yaml --checkpoint-dir artifacts/<task> --data-dir data/<task>
-# <task> is one of xsum, wmt14, sudoku-easy, sudoku-medium or sudoku-hard
+python evaluate.py --config config/eval/sudoku-easy.yaml --checkpoint-dir artifacts/sudoku/easy --data-dir data/sudoku/easy
 
-python evaluate.py --config config/eval/<dataset>.yaml --checkpoint-dir artifacts/<dataset>
-# <dataset> is tinystories, owt or lm1b-<size> with <size> one of small, medium or large
+# Download the matching directories before running other tasks:
+python evaluate.py --config config/eval/xsum.yaml --checkpoint-dir artifacts/xsum --data-dir data/xsum
+python evaluate.py --config config/eval/tinystories.yaml --checkpoint-dir artifacts/tinystories
+python evaluate.py --config config/eval/lm1b-small.yaml --checkpoint-dir artifacts/lm1b/small
 ```
 
 This runs one generation shard per visible GPU, merges them, and prints ROUGE-1/2/L and generative perplexity for XSum; cased and lowercased sacreBLEU, chrF and length ratio for WMT14; solved, cell and valid-grid rates for Sudoku; and generative perplexity under GPT-2 large with unigram entropy, over 5 seeds of 256 unconditional samples, for TinyStories, OpenWebText and LM1B, the latter under the FLM scoring protocol. Add `--cfg <scale>` for classifier-free guidance on XSum and WMT14; the guided WMT14 row uses `--cfg 1.0`.
 
 Add `--kv-cache` to reuse prefix keys and values at every level. Use `scripts/bench_kv.py` to check output identity and measure performance on your hardware. Without a CUDA GPU, `evaluate.py` runs a single shard on Apple silicon (MPS) or the CPU; set `NCM_DEVICE` to choose.
+
+`--bs` controls generation batches; `--score-bs` independently controls reference-model scoring batches. For limited VRAM, start with `--bs 1 --score-bs 1`. The orchestrator merges only the shards from its current run and validates their provenance. See [reconstruction contracts](docs/reconstruction.md) and [validation](docs/validation.md) for regression tests, timing boundaries and reproducibility limits.
 
 ## Repository layout
 

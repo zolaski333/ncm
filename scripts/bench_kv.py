@@ -1,131 +1,184 @@
-"""Time generation with and without the prefix KV cache and check that outputs match.
+"""Compare eager/cached conditional generation using the evaluation token policy.
 
-    python scripts/bench_kv.py --config config/eval/wmt14.yaml                    # 1024 inputs, batch 16
-    python scripts/bench_kv.py --config config/eval/xsum.yaml --n 256 --bs 64 --cfg 0.5
-    python scripts/bench_kv.py --config config/eval/sudoku-easy.yaml --checkpoint-dir artifacts/sudoku/easy \\
-        --data-dir data/sudoku/easy --n 2000 --bs 128
-
-Each mode (eager: generate(use_kv_cache=False), kv: use_kv_cache=True) runs the same inputs once after a
-warmup batch. Timing covers generation plus decoding to token ids (no detokenization or scoring). Prints
-throughput, peak device memory, the share of outputs identical to the first mode, and the task metric
-(BLEU for wmt14, ROUGE-L for xsum, solved % for sudoku).
+Timing includes generation, VQ decoding and frequency/adjacency penalties. It
+excludes loading, detokenization, reference scoring and output copies to the CPU.
 """
-import argparse, json, os, pickle, sys, time
+
+import argparse
+import gc
+import hashlib
+import json
+import pickle
+import statistics
+import subprocess
+import sys
+import time
+from pathlib import Path
+
 import torch
 from omegaconf import OmegaConf
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, ROOT)
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from evaluation.inference import artifact_subdir, load_inference_tensor, pick_tokens
 from models.next_concept import NextConceptTransformer
 from tokenization.vqvae_tokenizer import VQVAETokenizer
 from transformers import AutoTokenizer
-
-ap = argparse.ArgumentParser()
-ap.add_argument("--config", required=True)
-ap.add_argument("--checkpoint-dir", default="")
-ap.add_argument("--data-dir", default="")
-ap.add_argument("--n", type=int, default=1024)
-ap.add_argument("--bs", type=int, default=16)
-ap.add_argument("--cfg", type=float, default=None)
-ap.add_argument("--modes", default="eager,kv", help="comma-separated, each eager or kv")
-ap.add_argument("--json", default="", help="also write results to this file")
-a = ap.parse_args()
-
-CFG = OmegaConf.load(a.config)
-G = CFG.generation
-DEV = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-if DEV == "cuda":
-    # TF32 changes results with the matmul shapes, which differ between the two paths
-    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-ck = a.checkpoint_dir or os.path.join(ROOT, "artifacts", CFG.task)
-dd = a.data_dir or os.path.join(ROOT, "data", CFG.task)
-cfg = a.cfg if a.cfg is not None else float(G.get("cfg_scale", 0.0))
-temp, top_k, top_p = float(G.get("temperature", 1.0)), int(G.get("top_k", 1)), float(G.get("top_p", 0.0))
-if not (top_k == 1 or temp == 0):
-    print(f"note: {CFG.task} samples stochastically (temperature={temp}, top_k={top_k}); outputs will differ between modes", file=sys.stderr)
+from utils.misc import default_device, wide_float
 
 
-def sync():
-    if DEV == "cuda":
-        torch.cuda.synchronize()
-    elif DEV == "mps":
-        torch.mps.synchronize()
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(2**20):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def peak_gb():
-    if DEV == "cuda":
-        return torch.cuda.max_memory_allocated() / 1e9
-    if DEV == "mps":  # no peak counter on MPS: memory the driver holds at the end
-        return torch.mps.driver_allocated_memory() / 1e9
-    return float("nan")
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--checkpoint-dir", default="")
+    ap.add_argument("--data-dir", default="")
+    ap.add_argument("--n", type=int, default=1024)
+    ap.add_argument("--bs", type=int, default=16)
+    ap.add_argument("--cfg", type=float, default=None)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--modes", default="eager,kv")
+    ap.add_argument("--compare-shard", help="also require token identity with a saved single-shard evaluation")
+    ap.add_argument("--json", default="")
+    a = ap.parse_args()
+    modes = a.modes.split(",")
+    if min(a.n, a.bs, a.repeats) <= 0 or a.warmup < 0:
+        ap.error("n, bs and repeats must be positive; warmup must be nonnegative")
+    if any(mode not in ("eager", "kv") for mode in modes):
+        ap.error("modes must be eager or kv")
+
+    cfg = OmegaConf.load(a.config)
+    if not cfg.data or not cfg.data.get("test"):
+        ap.error("this benchmark requires a conditional test set")
+    device = default_device()
+    if str(device).startswith("cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+    ck = Path(a.checkpoint_dir) if a.checkpoint_dir else ROOT / "artifacts" / artifact_subdir(cfg.task)
+    dd = Path(a.data_dir) if a.data_dir else ROOT / "data" / artifact_subdir(cfg.task)
+    cfg.tokenizer.vqvae.checkpoint_path = str(ck / cfg.checkpoints.tokenizer)
+    tk = VQVAETokenizer.from_config(cfg.tokenizer)
+    tk.vqvae.to(device).eval()
+    net = NextConceptTransformer(tk.vqvae, cfg.model).to(device)
+    generator_path = ck / cfg.checkpoints.generator
+    checkpoint = torch.load(generator_path, map_location="cpu", weights_only=True)
+    net.load_state_dict(checkpoint["model"], strict=True)
+    net.eval()
+    g = cfg.generation
+    allowance = load_inference_tensor(
+        str(g.frequency_allowance), ck, device=device, dtype=wide_float(device),
+        checkpoint=checkpoint, checkpoint_path=generator_path,
+    ) if g.get("frequency_allowance") else None
+    del checkpoint
+    adjacency = [float(x) for x in str(g.adjacency_penalty).split(",")] if g.get("adjacency_penalty") else None
+    policy = dict(frequency=float(g.get("frequency_penalty", 0)), deficit=float(g.get("frequency_deficit", 0)),
+                  allowance=allowance, adjacency=adjacency)
+    guidance = a.cfg if a.cfg is not None else float(g.get("cfg_scale", 0))
+    sampling = dict(temperature=float(g.get("temperature", 1)), top_k=int(g.get("top_k", 1)),
+                    top_p=float(g.get("top_p", 0)), cfg_scale=guidance, cfg_null_eos=tk.pre_tokenizer.eos_token_id)
+
+    with open(dd / cfg.data.test, "rb") as stream:
+        items = pickle.load(stream)[:a.n]
+    with open(dd / cfg.data.test_refs, "rb") as stream:
+        refs = pickle.load(stream)[:a.n]
+    if not items or len(items) != len(refs):
+        raise ValueError("nonempty test inputs and references must align")
+    source_tokenizer = AutoTokenizer.from_pretrained(str(cfg.tokenizer.pre_tokenizer.model_id)) if isinstance(items[0], str) else None
+    P = int(cfg.model.prefix_len)
+    prefixes = []
+    for item in items:
+        tokens = source_tokenizer(item)["input_ids"] if source_tokenizer else list(item)
+        prefixes.append((tokens[:P] + [tk.pre_tokenizer.pad_token_id] * P)[:P])
+    inputs = torch.tensor(prefixes, device=device)
+
+    def sync():
+        if str(device).startswith("cuda"):
+            torch.cuda.synchronize(device)
+        elif str(device).startswith("mps"):
+            torch.mps.synchronize()
+
+    @torch.no_grad()
+    def run(batch, cached):
+        codes = net.generate(None, batch, use_kv_cache=cached, **sampling)
+        return codes, pick_tokens(tk.vqvae.decode(codes), **policy)
+
+    saved = None
+    if a.compare_shard:
+        with open(a.compare_shard, "rb") as stream:
+            part = pickle.load(stream)
+        if part["idxs"] != list(range(len(items))):
+            raise ValueError("comparison requires the same ordered single-shard inputs")
+        saved = torch.tensor(part["raw_ids"])
+
+    results, baseline = [], None
+    for mode in modes:
+        durations, peaks, calls_per_batch = [], [], []
+        for repeat in range(a.repeats):
+            torch.manual_seed(a.seed)
+            for _ in range(a.warmup):
+                run(inputs[:a.bs], mode == "kv")
+            sync()
+            gc.collect()
+            torch.manual_seed(a.seed)
+            if str(device).startswith("cuda"):
+                torch.cuda.reset_peak_memory_stats(device)
+            calls = []
+            hook = net.transformer.blocks[0].register_forward_hook(lambda *args: calls.append(1))
+            outputs = []
+            try:
+                start = time.perf_counter()
+                for offset in range(0, len(items), a.bs):
+                    outputs.append(run(inputs[offset:offset + a.bs], mode == "kv"))
+                sync()
+                durations.append(time.perf_counter() - start)
+                peaks.append(torch.cuda.max_memory_allocated(device) if str(device).startswith("cuda") else None)
+            finally:
+                hook.remove()
+            codes = torch.cat([out[0] for out in outputs]).cpu()
+            tokens = torch.cat([out[1] for out in outputs]).cpu()
+            del outputs
+            calls_per_batch.append(len(calls) / ((len(items) + a.bs - 1) // a.bs))
+            if baseline is None:
+                baseline = (codes, tokens)
+            if not torch.equal(codes, baseline[0]) or not torch.equal(tokens, baseline[1]):
+                raise RuntimeError(f"{mode} repeat {repeat}: concept codes or decoded tokens differ from the first run")
+            if saved is not None and not torch.equal(tokens, saved):
+                raise RuntimeError("benchmark output differs from eval_shard.py")
+        row = dict(mode=mode, times_seconds=durations, median_seconds=statistics.median(durations),
+                   peak_allocated_bytes=peaks, generator_calls_per_batch=calls_per_batch,
+                   concepts_identical=True, tokens_identical=True,
+                   matches_saved_shard=True if saved is not None else None)
+        results.append(row)
+        print(json.dumps(row), flush=True)
+
+    report = dict(
+        task=cfg.task, n=len(items), batch_size=a.bs, seed=a.seed, device=str(device),
+        gpu=torch.cuda.get_device_name(device) if str(device).startswith("cuda") else None,
+        torch=torch.__version__, dtype=str(next(net.parameters()).dtype), tf32=False,
+        git_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        dirty=bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT)),
+        source_sha256={path: sha256(ROOT / path) for path in (
+            "models/common.py", "models/next_concept.py", "models/quant.py",
+            "models/vqvae.py", "evaluation/inference.py", "scripts/bench_kv.py",
+        )},
+        sampling=sampling, final_token_policy={k: v for k, v in policy.items() if k != "allowance"},
+        config_sha256=sha256(a.config), generator_sha256=sha256(generator_path),
+        tokenizer_sha256=sha256(ck / cfg.checkpoints.tokenizer),
+        inputs_sha256=sha256(dd / cfg.data.test), results=results,
+        timing="generation + VQ decoding + final-token penalties; excludes loading, CPU copies and scoring",
+    )
+    if a.json:
+        Path(a.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.json).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
-CFG.tokenizer.vqvae.checkpoint_path = os.path.join(ck, CFG.checkpoints.tokenizer)
-tk = VQVAETokenizer.from_config(CFG.tokenizer)
-tk.vqvae = tk.vqvae.to(DEV).eval()
-net = NextConceptTransformer(vqvae_local=tk.vqvae, config=CFG.model).to(DEV)
-net.load_state_dict(torch.load(os.path.join(ck, CFG.checkpoints.generator), map_location="cpu", weights_only=False)["model"], strict=True)
-net.eval()
-EOS, PAD = tk.pre_tokenizer.eos_token_id, tk.pre_tokenizer.pad_token_id
-P = int(CFG.model.prefix_len)
-
-items = pickle.load(open(os.path.join(dd, CFG.data.test), "rb"))[:a.n]
-refs = pickle.load(open(os.path.join(dd, CFG.data.test_refs), "rb"))[:a.n]
-src_tok = AutoTokenizer.from_pretrained(str(CFG.tokenizer.pre_tokenizer.model_id)) if isinstance(items[0], str) else None
-X = torch.tensor([((src_tok(i)["input_ids"] if src_tok else list(i))[:P] + [PAD] * P)[:P] for i in items], device=DEV)
-n = X.shape[0]
-
-
-def dec(ids):
-    ids = ids[:ids.index(EOS)] if EOS in ids else ids
-    return tk.pre_tokenizer.decode([t for t in ids if t not in (EOS, PAD)], skip_special_tokens=True)
-
-
-@torch.no_grad()
-def run(x, kv):
-    torch.manual_seed(0)
-    g = net.generate(None, x, temperature=temp, top_k=top_k, top_p=top_p, cfg_scale=cfg, cfg_null_eos=EOS, use_kv_cache=kv)
-    _, zl = tk.vqvae.vq.idx_to_zhats(g, return_zlevels=True)
-    return tk.vqvae.decoder(zl[-1]).argmax(-1)
-
-
-def metric(hyps):
-    ref_txt = [r if isinstance(r, str) else dec(list(r)) for r in refs]
-    if CFG.eval.metric == "bleu":
-        import sacrebleu
-        return "BLEU", sacrebleu.corpus_bleu(hyps, [ref_txt]).score
-    if CFG.eval.metric == "rouge":
-        from rouge_score import rouge_scorer
-        sc = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-        return "ROUGE-L", 100 * sum(sc.score(r, h)["rougeL"].fmeasure for r, h in zip(ref_txt, hyps)) / len(hyps)
-    if CFG.eval.metric == "exact":
-        return "solved%", 100 * sum(h == r for h, r in zip(hyps, ref_txt)) / len(hyps)
-    return "-", float("nan")
-
-
-name = torch.cuda.get_device_name() if DEV == "cuda" else DEV
-print(f"[{CFG.task}] device={name} torch={torch.__version__} n={n} bs={a.bs} cfg={cfg}", flush=True)
-results, base = [], None
-for mode in a.modes.split(","):
-    assert mode in ("eager", "kv"), f"bad mode {mode}"
-    kv = mode == "kv"
-    run(X[:a.bs], kv)  # warmup
-    sync()
-    if DEV == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-    outs, t = [], time.perf_counter()
-    for s in range(0, n, a.bs):
-        outs.append(run(X[s:s + a.bs], kv))
-    sync(); dt = time.perf_counter() - t
-    out = torch.cat(outs).cpu()
-    base = out if base is None else base
-    same = (out == base).all(1).float().mean().item()
-    mname, mval = metric([dec(r) for r in out.tolist()])
-    r = dict(task=CFG.task, mode=mode, device=name, n=n, bs=a.bs, cfg=cfg, seconds=dt, seq_per_s=n / dt,
-             peak_gb=peak_gb(), identical_to_first=same, metric=mname, score=mval)
-    results.append(r)
-    print(f"{mode:6s} {dt:8.2f}s  {n / dt:8.1f} seq/s  peak {r['peak_gb']:5.2f} GB  identical {same:6.1%}  {mname} {mval:.2f}", flush=True)
-if len(results) == 2:
-    print(f"speedup {results[1]['mode']} vs {results[0]['mode']}: {results[0]['seconds'] / results[1]['seconds']:.2f}x")
-if a.json:
-    json.dump(results, open(a.json, "w"), indent=1)
+if __name__ == "__main__":
+    main()

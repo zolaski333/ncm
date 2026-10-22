@@ -1,4 +1,4 @@
-import argparse, os, subprocess, sys
+import argparse, os, subprocess, sys, uuid
 
 import torch
 from omegaconf import OmegaConf
@@ -14,7 +14,10 @@ def main():
     ap.add_argument("--out", default="", help="output directory (default eval/<task>)")
     ap.add_argument("--gpus", default="", help="comma-separated GPU ids (default: all visible)")
     ap.add_argument("--n", type=int, default=0, help="evaluate only the first n inputs")
+    ap.add_argument("--score-bs", type=int, default=0, help="reference-model batch size (independent of generation --bs)")
     args, passthrough = ap.parse_known_args()
+    if args.score_bs < 0:
+        ap.error("--score-bs must be positive")
 
     cfg = OmegaConf.load(args.config)
     gpus = args.gpus.split(",") if args.gpus else [str(i) for i in range(torch.cuda.device_count())]
@@ -24,18 +27,22 @@ def main():
     out = args.out or os.path.join("eval", cfg.task)
     os.makedirs(out, exist_ok=True)
 
-    common = ["--config", args.config, "--checkpoint-dir", args.checkpoint_dir] + (["--data-dir", args.data_dir] if args.data_dir else []) + [
+    run_id = uuid.uuid4().hex
+    common = ["--config", args.config, "--checkpoint-dir", args.checkpoint_dir, "--run-id", run_id] + (["--data-dir", args.data_dir] if args.data_dir else []) + [
               "--nshards", str(len(gpus))] + (["--n", str(args.n)] if args.n else []) + passthrough
     procs = []
+    shard_files = []
     for k, gpu in enumerate(gpus):
         env = dict(os.environ, TOKENIZERS_PARALLELISM="false")
         if gpu is not None:
             env["CUDA_VISIBLE_DEVICES"] = gpu
-        log = open(os.path.join(out, f"shard_{k}.log"), "w")
-        procs.append(subprocess.Popen(
-            [sys.executable, os.path.join(ROOT, "scripts", "eval_shard.py"), *common,
-             "--shard", str(k), "--out", os.path.join(out, f"shard_{k}.pkl")],
-            env=env, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT))
+        shard_file = os.path.join(out, f"shard_{k}.pkl")
+        shard_files.append(shard_file)
+        with open(os.path.join(out, f"shard_{k}.log"), "w") as log:
+            procs.append(subprocess.Popen(
+                [sys.executable, os.path.join(ROOT, "scripts", "eval_shard.py"), *common,
+                 "--shard", str(k), "--out", shard_file],
+                env=env, stdout=log, stderr=subprocess.STDOUT, cwd=ROOT))
     where = f"GPU(s) {','.join(gpus)}" if gpus != [None] else "local device (no CUDA)"
     print(f"[evaluate] {len(gpus)} shard(s) on {where} -> {out}/", flush=True)
     failed = [k for k, p in enumerate(procs) if p.wait() != 0]
@@ -43,7 +50,7 @@ def main():
         sys.exit(f"shard(s) {failed} failed; see {out}/shard_*.log")
 
     subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "eval_merge.py"), "--config", args.config,
-                    "--glob", os.path.join(out, "shard_*.pkl")], check=True, cwd=ROOT)
+                    "--shards", *shard_files, "--run-id", run_id, "--score-bs", str(args.score_bs)], check=True, cwd=ROOT)
 
 
 if __name__ == "__main__":
